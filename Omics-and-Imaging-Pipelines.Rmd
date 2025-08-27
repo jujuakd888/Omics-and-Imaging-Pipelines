@@ -1,0 +1,345 @@
+---
+title: "Omics-and-Imaging-Pipelines"
+author: "Jude Akkad"
+date: "2025-08-27"
+output: html_document
+---
+#Setup
+Setup for the pipeline — loads libraries and defines paths. Tested with TCGA-BRCA data from UCSC Xena.
+```{r}
+# Load core libraries
+knitr::opts_chunk$set(echo = TRUE)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(ggplot2)
+  library(pheatmap)
+  library(survival)
+})
+
+# --------------------------------------------------------
+# If toy datasets don't exist, generate them automatically
+# --------------------------------------------------------
+if (!file.exists("data/toy_expression.csv") || !file.exists("data/toy_phenotype.csv")) {
+  if (!dir.exists("data")) dir.create("data")
+  
+  set.seed(123)
+  genes <- c("BGN","DCN","LUM","MMP2","VCAN")
+  samples <- paste0("Sample", 1:20)
+  
+  toy_expr <- matrix(
+    rnorm(length(genes) * length(samples), mean = 10, sd = 3),
+    nrow = length(genes), ncol = length(samples),
+    dimnames = list(genes, samples)
+  )
+  toy_expr <- as.data.frame(toy_expr)
+  toy_expr <- tibble::rownames_to_column(toy_expr, "symbol")
+  
+  toy_pheno <- data.frame(
+    sample      = samples,
+    sample_type = rep(c("Tumor","Normal"), each = 10),
+    OS.time     = sample(200:1000, 20),
+    OS          = sample(0:1, 20, replace=TRUE)
+  )
+  
+  write.csv(toy_expr,  "data/toy_expression.csv", row.names = FALSE)
+  write.csv(toy_pheno, "data/toy_phenotype.csv", row.names = FALSE)
+  cat("Toy data generated in /data folder\n")
+}
+
+# --------------------------------------------------------
+# Choose data source (toy vs real TCGA)
+# --------------------------------------------------------
+use_toy <- TRUE  # flip to FALSE if using real TCGA files
+
+if (use_toy) {
+  expr_file  <- "data/toy_expression.csv"
+  pheno_file <- "data/toy_phenotype.csv"
+} else {
+  # You must download these manually from UCSC Xena
+  expr_file  <- "TCGA-BRCA.star_counts.tsv.gz"
+  pheno_file <- "TCGA-BRCA.clinical.tsv.gz"
+}
+
+
+```
+
+#Expression Import + Gene Map 
+```{r}
+# ---- Expression Import ----
+
+# Load expression file (toy CSV or TCGA .tsv.gz)
+expr <- read_csv(expr_file)
+
+# For toy dataset: already has "symbol" as first column
+if ("symbol" %in% colnames(expr)) {
+  expr_genes <- expr
+} else {
+  # For TCGA/Xena data: requires Ensembl → Symbol mapping
+  names(expr)[1] <- "ensembl"
+  expr <- expr %>% mutate(ensembl = sub("\\..*", "", ensembl))
+  
+  gene_map <- tibble::tribble(
+    ~ensembl,          ~symbol,
+    "ENSG00000182492", "BGN",
+    "ENSG00000011465", "DCN",
+    "ENSG00000106819", "ASPN",
+    "ENSG00000144821", "FMOD",
+    "ENSG00000139329", "LUM",
+    "ENSG00000161929", "PRELP",
+    "ENSG00000136999", "VCAN",
+    "ENSG00000108821", "COL1A1",
+    "ENSG00000107796", "MMP2",
+    "ENSG00000100985", "MMP9"
+  )
+  
+  expr_genes <- expr %>%
+    inner_join(gene_map, by = "ensembl") %>%
+    select(symbol, everything(), -ensembl)
+}
+
+
+```
+
+#Quick check Plot
+This is meant to check the distribution of expression values across samples.
+
+```{r}
+expr_long <- expr %>%
+  pivot_longer(cols = -symbol, names_to = "sample", values_to = "expression")
+
+ggplot(expr_long, aes(x = symbol, y = expression)) +
+  geom_boxplot(outlier.size = 0.5, fill = "skyblue") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "QC: Distribution of expression values", x = "Gene", y = "Expression")
+
+```
+
+#Tumor vs Normal Comparision
+This joins phenotype table (sample metadata) with expression values it also compares expression in Tumor vs Normal samples. 
+```{r}
+# ---- Tumor vs Normal Comparison ----
+
+# Make sure expression is in long format
+expr_long <- expr %>%
+  pivot_longer(cols = -symbol, names_to = "sample", values_to = "expression")
+
+# Standardise sample IDs in phenotype (in case of toy vs TCGA mismatch)
+pheno <- pheno %>%
+  rename(sample_id = sample, group = sample_type)
+
+# Join expression with phenotype
+expr_long <- expr_long %>%
+  left_join(pheno, by = c("sample" = "sample_id")) %>%
+  filter(group %in% c("Tumor", "Normal"))
+
+# Boxplot by Tumor vs Normal
+ggplot(expr_long, aes(x = group, y = expression, fill = group)) +
+  geom_boxplot(outlier.size = 0.5) +
+  facet_wrap(~ symbol, scales = "free_y") +
+  theme_bw(base_size = 12) +
+  labs(title = "Tumor vs Normal expression", x = "Sample Type", y = "Expression")
+
+# Wilcoxon test per gene
+wilcox_results <- expr_long %>%
+  group_by(symbol) %>%
+  summarise(
+    p_value = wilcox.test(expression ~ group)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(FDR = p.adjust(p_value, method = "fdr"))
+
+wilcox_results
+
+```
+
+ Visualize overall expression patterns across samples
+```{r}
+# ---- Heatmap of Expression ----
+
+# Build matrix (genes × samples)
+mat <- expr_genes
+rownames(mat) <- mat$symbol
+mat <- mat[, -1]
+mat <- as.matrix(mat)
+mode(mat) <- "numeric"
+
+# Heatmap of all samples
+pheatmap(
+  mat,
+  scale = "row",
+  show_colnames = FALSE,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  main = "Heatmap of expression"
+)
+
+# ---- Summary Tumor vs Normal averages ----
+expr_summary <- expr_long %>%
+  group_by(symbol, group) %>%   # <-- changed from sample_type → group
+  summarise(mean_expr = mean(expression, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = mean_expr)
+
+# Convert to matrix
+mat_summary <- as.data.frame(expr_summary)
+rownames(mat_summary) <- mat_summary$symbol
+mat_summary <- mat_summary[, -1]
+
+# Heatmap of group averages
+pheatmap(
+  as.matrix(mat_summary),
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  main = "Average expression (Tumor vs Normal)"
+)
+
+
+```
+```{r}
+# ---- Align expression with phenotype ----
+
+# Load phenotype file
+pheno <- read_csv(pheno_file)
+
+# For toy data: already has sample + sample_type
+# For TCGA: make sure you standardise columns
+if (!"sample" %in% colnames(pheno)) {
+  stop("Phenotype file must include a 'sample' column")
+}
+
+# Pivot expression into long format
+expr_long <- expr_genes %>%
+  pivot_longer(cols = -symbol, names_to = "sample", values_to = "expression") %>%
+  left_join(pheno %>% select(sample, sample_type), by = "sample") %>%
+  filter(sample_type %in% c("Tumor","Normal"))
+
+```
+
+#Volcano Plot
+Highlight up/down-regulated genes in Tumor vs Normal
+```{r}
+# ---- Volcano Plot ----
+
+volcano_data <- expr_long %>%
+  group_by(symbol, sample_type) %>%
+  summarise(mean_expr = mean(expression, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = sample_type, values_from = mean_expr) %>%
+  left_join(wilcox_results, by = "symbol") %>%
+  mutate(
+    log2FC = Tumor - Normal,
+    negLogP = -log10(p_value)
+  )
+
+ggplot(volcano_data, aes(x = log2FC, y = negLogP, label = symbol)) +
+  geom_point(color = "steelblue", size = 3) +
+  geom_text(vjust = -0.5, size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  theme_bw(base_size = 12) +
+  labs(title = "Volcano plot: Tumor vs Normal", x = "log2 Fold Change", y = "-log10 p-value")
+
+```
+```{r}
+# ---- Prepare Expression Matrix ----
+# Convert tibble → data.frame so rownames work
+mat <- as.data.frame(expr_genes)
+
+# Set symbols as rownames
+rownames(mat) <- mat$symbol
+
+# Drop the "symbol" column
+mat <- mat[, -1, drop = FALSE]
+
+# Force numeric matrix
+mat <- as.matrix(mat)
+mode(mat) <- "numeric"
+
+# Quick check
+print(rownames(mat))   # should show "BGN" "DCN" "LUM" "MMP2" "VCAN"
+
+```
+
+#Kaplan–Meier Survival Analysis
+Example: survival analysis for priority genes
+```{r}
+# ---- Kaplan–Meier Survival Analysis ----
+
+library(survival)
+
+priority_genes <- c("DCN", "BGN", "VCAN") # toy dataset genes
+
+# Keep only genes actually present in the expression matrix
+valid_genes <- intersect(priority_genes, rownames(mat))
+
+# Loop through valid genes
+for (gene in priority_genes) {
+  
+  if (!(gene %in% valid_genes)) {
+    cat("Skipping", gene, "- not found in expression matrix.\n")
+    next
+  }
+  
+  # Build dataframe for this gene
+  df <- data.frame(
+    sample = colnames(mat),
+    expr   = as.numeric(mat[gene, ])
+  )
+  df <- merge(df, pheno[, c("sample", "OS.time", "OS")], by = "sample")
+  
+  # Skip if no survival info
+  if (all(is.na(df$OS)) || all(is.na(df$OS.time))) {
+    cat("Skipping", gene, "- survival data missing.\n")
+    next
+  }
+  
+  # Group patients by expression (median split)
+  df$group <- ifelse(df$expr >= median(df$expr, na.rm = TRUE), "High", "Low")
+  
+  # Kaplan–Meier fit
+  surv_obj <- Surv(time = df$OS.time, event = df$OS)
+  fit <- survfit(surv_obj ~ group, data = df)
+  
+  # Inline plot (will appear in knitted HTML/PDF)
+  plot(fit, col = c("red", "blue"), lwd = 2,
+       xlab = "Time (days)", ylab = "Survival probability",
+       main = paste("Survival curves for", gene))
+  legend("bottomleft", legend = c("High expr", "Low expr"),
+         col = c("red", "blue"), lwd = 2, bty = "n")
+}
+
+```
+```{r}
+# After volcano plot
+ggsave("figs/volcano_demo.png", width = 6, height = 4)
+
+# After heatmap
+ggsave("figs/heatmap_demo.png", width = 6, height = 4)
+
+# After KM plot (e.g., for DCN)
+ggsave("figs/KM_DCN.png", width = 6, height = 4)
+d
+```
+
+#Executive Summary
+```{r}
+# ---- Executive Summary ----
+cat("
+This demo RMarkdown illustrates a reproducible workflow for TCGA-style expression analysis.
+
+Includes:
+- Tumor vs Normal comparison
+- Heatmap
+- Volcano plot
+- Survival analysis
+
+Customise by swapping expr_file, pheno_file, and genes_of_interest.
+")
+
+
+```
+
